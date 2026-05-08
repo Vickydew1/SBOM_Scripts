@@ -1,0 +1,184 @@
+# Setup:
+# Pipeline → Edit → Variables → Add these variables
+#
+# ACCUKNOX_TOKEN
+# ACCUKNOX_LABEL
+# ACCUKNOX_ENDPOINT
+#
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+
+  # Project metadata
+  - name: PROJECT_NAME
+    value: sbom-demo
+
+  - name: PROJECT_CLASSIFIER
+    value: application
+
+  # Filesystem scan target
+  - name: SCAN_PATH
+    value: "."
+
+  # Leave empty for filesystem scan
+  - name: IMAGE
+    value: ""
+
+steps:
+
+# Checkout repository
+- checkout: self
+
+# Install Node.js
+- task: NodeTool@0
+  inputs:
+    versionSpec: '18.20.4'
+  displayName: "Install Node.js"
+
+# Install dependencies
+- bash: |
+    npm install
+  displayName: "Install Dependencies"
+
+# Verify dependencies
+- bash: |
+    echo "Current directory:"
+    pwd
+
+    echo "Files:"
+    ls -la
+
+    echo "package.json:"
+    cat package.json
+
+    echo "Installed packages:"
+    npm list
+
+  displayName: "Verify Installed Packages"
+
+# Install knoxctl
+- bash: |
+    set -euo pipefail
+
+    BIN_DIR="$(Agent.TempDirectory)/knoxctl-bin"
+
+    mkdir -p "$BIN_DIR"
+
+    curl -fsSL \
+      "https://github.com/accuknox/accuknox-cli-v2/releases/download/v0.10.0/knoxctl_0.10.0_linux_amd64.tar.gz" \
+      -o "$(Agent.TempDirectory)/knoxctl.tar.gz"
+
+    tar -xzf "$(Agent.TempDirectory)/knoxctl.tar.gz" -C "$BIN_DIR"
+
+    chmod +x "$BIN_DIR/knoxctl"
+
+    echo "##vso[task.prependpath]$BIN_DIR"
+
+  displayName: "Install knoxctl"
+
+# Resolve SBOM output path
+- bash: |
+    set -euo pipefail
+
+    REPO_SLUG=$(echo "$(Build.Repository.Name)" | tr '/' '-')
+
+    BOM_FILE="$(System.DefaultWorkingDirectory)/${REPO_SLUG}-sbom.json"
+
+    echo "BOM file: $BOM_FILE"
+
+    echo "##vso[task.setvariable variable=BOM_FILE]$BOM_FILE"
+
+  displayName: "Resolve SBOM output path"
+
+# Generate SBOM
+- bash: |
+    set -euo pipefail
+
+    if [ -n "$(IMAGE)" ]; then
+      SOURCE="registry:$(IMAGE)"
+    else
+      SOURCE="dir:$(SCAN_PATH)"
+    fi
+
+    echo "Scanning source: $SOURCE"
+
+    knoxctl pkgscan "$SOURCE" \
+      -o "cyclonedx-json=$(BOM_FILE)" \
+      --quiet
+
+    echo "Generated SBOM:"
+    cat "$(BOM_FILE)"
+
+  displayName: "Generate SBOM"
+
+# Patch SBOM metadata
+- bash: |
+    set -euo pipefail
+
+    if ! command -v jq >/dev/null 2>&1; then
+      sudo apt-get update
+      sudo apt-get install -y jq
+    fi
+
+    PATCHED=$(jq \
+      --arg project "$(PROJECT_NAME)" \
+      --arg classifier "$(PROJECT_CLASSIFIER)" \
+      '( if has("$schema") then {"$schema": .["$schema"]} else {} end )
+       + {"project_name": $project, "project_classifier": $classifier}
+       + ( del(.["$schema"]) )' \
+      "$(BOM_FILE)")
+
+    echo "$PATCHED" > "$(BOM_FILE)"
+
+    echo "Patched SBOM:"
+    cat "$(BOM_FILE)"
+
+  displayName: "Patch BOM JSON"
+
+# Upload SBOM to AccuKnox
+- bash: |
+    set -euo pipefail
+
+    echo "Uploading SBOM to AccuKnox..."
+
+    HTTP_STATUS=$(curl --location \
+      "https://${ACCUKNOX_ENDPOINT}/api/v1/artifact/?data_type=SBOM&save_to_s3=True&label_id=${ACCUKNOX_LABEL}" \
+      --header "Authorization: Bearer ${ACCUKNOX_TOKEN}" \
+      --form "file=@$(BOM_FILE)" \
+      --output /tmp/ak_response.json \
+      --write-out "%{http_code}" \
+      --insecure)
+
+    cat /tmp/ak_response.json || true
+
+    echo ""
+
+    if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+      echo "##vso[task.logissue type=error]Upload failed (HTTP $HTTP_STATUS)"
+      exit 1
+    fi
+
+    echo "Upload OK (HTTP $HTTP_STATUS)"
+
+  displayName: "Upload SBOM to AccuKnox"
+
+  env:
+    ACCUKNOX_TOKEN: $(ACCUKNOX_TOKEN)
+    ACCUKNOX_LABEL: $(ACCUKNOX_LABEL)
+    ACCUKNOX_ENDPOINT: $(ACCUKNOX_ENDPOINT)
+
+# Publish SBOM artifact
+- task: PublishPipelineArtifact@1
+  displayName: "Save SBOM artifact"
+  inputs:
+    targetPath: "$(BOM_FILE)"
+    artifact: "$(Build.Repository.Name)-sbom-$(Build.BuildNumber)"
+    publishLocation: pipeline
+
