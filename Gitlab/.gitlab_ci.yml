@@ -1,0 +1,171 @@
+# # ─────────────────────────────────────────────────────────────────────────────
+# AccuKnox xBOM Scan — GitLab CI/CD
+# Generates an xBOM (SBOM / CBOM / AIBOM) using knoxctl and uploads to
+# AccuKnox Dashboard.
+#
+# Required CI/CD Variables (Settings → CI/CD → Variables):
+#   ACCUKNOX_TOKEN             — AccuKnox artifact token
+#   ACCUKNOX_ENDPOINT          — AccuKnox SaaS hostname (e.g. cspm.accuknox.com)
+#   ACCUKNOX_LABEL             — AccuKnox label ID
+#   APROJECT_NAME      — AccuKnox project name
+#   PROJECT_CLASSIFIER— e.g. container, application, firmware
+#
+# Optional CI/CD Variables (or override per-job):
+#   BOM_TYPE             — sbom | cbom | aibom  (default: sbom)
+#   SCAN_PATH            — directory to scan    (default: .)
+#   SCAN_IMAGE           — container image to scan (mutually exclusive with SCAN_PATH)
+#   AIBOM_MODEL          — HuggingFace model name (required when BOM_TYPE=aibom)
+#   OUTPUT_FILE          — custom output file path (auto-derived when omitted)
+# ─────────────────────────────────────────────────────────────────────────────
+─────────────────────────────────────────────────────────────────────────────
+# AccuKnox xBOM Scan — GitLab CI/CD
+# Generates an xBOM (SBOM / CBOM / AIBOM) using knoxctl and uploads to
+# AccuKnox Dashboard.
+
+
+variables:
+  BOM_TYPE: ""
+  SCAN_PATH: ""
+  SCAN_IMAGE: ""
+  AIBOM_MODEL: ""
+  OUTPUT_FILE: ""
+  KNOXCTL_VERSION: "0.10.0"
+
+stages:
+  - bom-scan
+
+accuknox-xbom-scan:
+  stage: bom-scan
+  image: ubuntu:22.04
+
+  before_script:
+    # Install dependencies
+    - apt-get update -qq && apt-get install -y -qq curl jq tar
+
+    #  1. Download knoxctl
+    - |
+      BIN_DIR="/tmp/knoxctl-bin"
+      mkdir -p "$BIN_DIR"
+      curl -fL \
+        "https://github.com/accuknox/accuknox-cli-v2/releases/download/v${KNOXCTL_VERSION}/knoxctl_${KNOXCTL_VERSION}_linux_amd64.tar.gz" \
+        -o "/tmp/knoxctl.tar.gz"
+      tar -xzf "/tmp/knoxctl.tar.gz" -C "$BIN_DIR"
+      chmod +x "$BIN_DIR/knoxctl"
+      export PATH="$BIN_DIR:$PATH"
+      knoxctl version
+
+    # 2. Resolve BOM output path
+    - |
+      if [ -n "$OUTPUT_FILE" ]; then
+        BOM_FILE="$OUTPUT_FILE"
+      else
+        REPO_SLUG=$(echo "${CI_PROJECT_PATH}" | tr '/' '-')
+        BOM_FILE="${CI_PROJECT_DIR}/${REPO_SLUG}-${BOM_TYPE}.json"
+      fi
+      echo "BOM_FILE=${BOM_FILE}" >> "$CI_ENV" 2>/dev/null || export BOM_FILE="$BOM_FILE"
+      # Store for use across script blocks
+      echo "$BOM_FILE" > /tmp/bom_file_path.txt
+      echo "Resolved BOM output path: $BOM_FILE"
+
+  script:
+    - export PATH="/tmp/knoxctl-bin:$PATH"
+    - BOM_FILE=$(cat /tmp/bom_file_path.txt)
+
+    # 3a. SBOM 
+    # knoxctl pkgscan wraps syft.
+    # dir:<path>       → filesystem scan
+    # registry:<image> → pull directly from registry (no daemon needed)
+    - |
+      if [ "$BOM_TYPE" = "sbom" ]; then
+        echo ">>> Generating SBOM..."
+        if [ -n "$SCAN_IMAGE" ]; then
+          SOURCE="registry:${SCAN_IMAGE}"
+        else
+          SOURCE="dir:${SCAN_PATH}"
+        fi
+        knoxctl pkgscan "$SOURCE" -o "cyclonedx-json=${BOM_FILE}" --quiet
+      fi
+
+    # 3b. CBOM 
+    # knoxctl cbom source <path>  → scans Go source code
+    # knoxctl cbom image  <ref>   → scans a container image
+    - |
+      if [ "$BOM_TYPE" = "cbom" ]; then
+        echo ">>> Generating CBOM..."
+        if [ -n "$SCAN_IMAGE" ]; then
+          echo "CBOM scanning image: ${SCAN_IMAGE}"
+          knoxctl cbom image \
+            --image  "$SCAN_IMAGE" \
+            --out    "$BOM_FILE" \
+            --format json
+        else
+          echo "CBOM scanning source: ${SCAN_PATH}"
+          knoxctl cbom source "$SCAN_PATH" \
+            --out    "$BOM_FILE" \
+            --format json
+        fi
+      fi
+
+    # 3c. AIBOM 
+    # knoxctl aibom generate --model <hf-model>
+    # fetches metadata from HuggingFace Hub API
+    - |
+      if [ "$BOM_TYPE" = "aibom" ]; then
+        echo ">>> Generating AIBOM..."
+        if [ -z "$AIBOM_MODEL" ]; then
+          echo "ERROR: AIBOM_MODEL is required when BOM_TYPE=aibom"
+          exit 1
+        fi
+        echo "AIBOM scanning model: ${AIBOM_MODEL}"
+        knoxctl aibom generate \
+          --model  "$AIBOM_MODEL" \
+          --out    "$BOM_FILE" \
+          --format json
+      fi
+
+    # 4. Patch BOM JSON
+    # Injects project_name and project_classifier as top-level fields:
+    #   {
+    #     "$schema":            "http://cyclonedx.org/schema/bom-1.6.schema.json",
+    #     "project_name":       "<project-name>",
+    #     "project_classifier": "<classifier>",
+    #     "bomFormat":          "CycloneDX",
+    #     ...
+    #   }
+    - |
+      echo ">>> Patching BOM JSON with project metadata..."
+      PATCHED=$(jq \
+        --arg project    "$PROJECT_NAME" \
+        --arg classifier "$PROJECT_CLASSIFIER" \
+        '( if has("$schema") then {"$schema": .["$schema"]} else {} end )
+         + {"project_name": $project, "project_classifier": $classifier}
+         + ( del(.["$schema"]) )' \
+        "$BOM_FILE")
+      echo "$PATCHED" > "$BOM_FILE"
+
+    #  5. Upload to AccuKnox SaaS 
+    - |
+      echo ">>> Uploading BOM to AccuKnox SaaS..."
+      HTTP_STATUS=$(curl --location \
+        "https://${ACCUKNOX_ENDPOINT}/api/v1/artifact/?data_type=SBOM&save_to_s3=True&label_id=${ACCUKNOX_LABEL}" \
+        --header "Authorization: Bearer ${ACCUKNOX_TOKEN}" \
+        --form "file=@${BOM_FILE}" \        --output /tmp/ak_response.json \
+        --write-out "%{http_code}" \
+        --insecure)
+
+      echo "Upload HTTP Status: ${HTTP_STATUS}"
+      cat /tmp/ak_response.json
+
+      if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
+        echo "ERROR: Upload failed (HTTP ${HTTP_STATUS})"
+        exit 1
+      fi
+
+  # ── 6. Save BOM as GitLab artifact ───────────────────────────────────────
+  # Download: CI/CD → Pipelines → Job → Download artifacts
+  artifacts:
+    name: "${CI_PROJECT_NAMESPACE}-${BOM_TYPE}-${CI_PIPELINE_IID}"
+    paths:
+      - "*.json"
+    expire_in: 30 days
+    when: always
