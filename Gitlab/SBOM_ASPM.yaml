@@ -1,0 +1,119 @@
+spec:
+  inputs:
+    JOB_NAME:
+      description: "Job name. Set a unique value when including this component more than once."
+      default: "accuknox-sbom-scan"
+      type: string
+    STAGE:
+      default: test
+    CLI_IMAGE:
+      default: "public.ecr.aws/k9v9d5v2/accuknox-aspm-scanner:v0.14.3"
+    DOCKER_DIND_IMAGE:
+      default: "docker:28.2.2-dind"
+    SCAN_IMAGE:
+      default: ""
+    SOFT_FAIL:
+      description: "Do not return an error code if there are failed checks"
+      default: true
+      type: boolean
+    SCAN_TYPE:
+      description: "SBOM target type. Use image or path."
+      default: "path"
+      type: string
+    IMAGE_REF:
+      description: "Full registry image reference to scan. Required when SCAN_TYPE is image."
+      default: ""
+      type: string
+    SCAN_PATH:
+      description: "Filesystem path to scan. Used when SCAN_TYPE is path."
+      default: "."
+      type: string
+    SEVERITY:
+      description: "Comma-separated severities: UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL"
+      default: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+      type: string
+    PROJECT_NAME:
+      description: "Project name (AccuKnox entity). Required for SBOM uploads."
+      default: ""
+      type: string
+---
+
+"$[[ inputs.JOB_NAME ]]":
+  stage: $[[ inputs.STAGE ]]
+  tags: k8s-accuknox-test
+  image:
+    name: $[[ inputs.CLI_IMAGE ]]
+    entrypoint:
+      - '/usr/bin/env'
+      - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  services:
+    - name: $[[ inputs.DOCKER_DIND_IMAGE ]]
+      alias: docker
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_HOST: "tcp://docker:2375"
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_DRIVER: overlay2
+    GIT_DEPTH: "0"
+    SOFT_FAIL: "$[[ inputs.SOFT_FAIL ]]"
+    SCAN_TYPE: "$[[ inputs.SCAN_TYPE ]]"
+    IMAGE_REF: "$[[ inputs.IMAGE_REF ]]"
+    SCAN_PATH: "$[[ inputs.SCAN_PATH ]]"
+    SEVERITY: "$[[ inputs.SEVERITY ]]"
+    PROJECT_NAME: "$[[ inputs.PROJECT_NAME ]]"
+  before_script:
+    - |
+      if [ -n "$[[ inputs.SCAN_IMAGE ]]" ]; then
+        export SCAN_IMAGE="$[[ inputs.SCAN_IMAGE ]]"
+      fi
+      for i in $(seq 1 60); do
+        docker info >/dev/null 2>&1 && break
+        sleep 2
+      done
+      docker info || exit 1
+      if [ -z "${GAR_REGISTRY:-}" ]; then
+        echo "ERROR: Set GAR_REGISTRY in Project CI/CD Variables."
+        exit 1
+      fi
+      if [ -f "${GAR_JSON_KEY:-}" ]; then
+        docker login -u _json_key --password-stdin "${GAR_REGISTRY}" < "${GAR_JSON_KEY}"
+      elif [ -n "${GAR_JSON_KEY_B64:-}" ]; then
+        echo "${GAR_JSON_KEY_B64}" | base64 -d | docker login -u _json_key --password-stdin "${GAR_REGISTRY}"
+      else
+        echo "ERROR: Set GAR_JSON_KEY (File) or GAR_JSON_KEY_B64 in Project CI/CD Variables."
+        exit 1
+      fi
+  script:
+    - |
+      SOFT_FAIL="${SOFT_FAIL//[$'\t\r\n ']}"
+      SCAN_TYPE="${SCAN_TYPE//[$'\t\r\n ']}"
+      SOFT_FAIL_ARG=""
+      if [ "$SOFT_FAIL" = "true" ]; then
+        SOFT_FAIL_ARG="--softfail"
+      fi
+
+      if [ -z "$PROJECT_NAME" ]; then
+        echo "ERROR: PROJECT_NAME is required for SBOM uploads."
+        exit 1
+      fi
+
+      if [ "$SCAN_TYPE" = "image" ]; then
+        if [ -z "$IMAGE_REF" ]; then
+          echo "ERROR: IMAGE_REF is required when SCAN_TYPE is image."
+          exit 1
+        fi
+        CMD="image ${IMAGE_REF}"
+        [ -n "$SEVERITY" ] && CMD="$CMD --severity $SEVERITY"
+      elif [ "$SCAN_TYPE" = "path" ]; then
+        CMD="fs ${SCAN_PATH}"
+      else
+        echo "ERROR: Invalid SCAN_TYPE: $SCAN_TYPE. Expected image or path."
+        exit 1
+      fi
+
+      echo accuknox-aspm-scanner scan $SOFT_FAIL_ARG --keep-results --project-name "$PROJECT_NAME" container --command "$CMD" --generate-sbom --container-mode
+      accuknox-aspm-scanner scan $SOFT_FAIL_ARG --keep-results --project-name "$PROJECT_NAME" container --command "$CMD" --generate-sbom --container-mode
+  artifacts:
+    when: always
+    paths:
+      - results.json
